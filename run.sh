@@ -1,0 +1,1 @@
+python scripts/dist_clip_voc.py --config configs/voc_attn_reg.yaml
