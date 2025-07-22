@@ -12,7 +12,7 @@ def build_vssm_model(config, **kwargs):
     model_type = config.MODEL.TYPE
     if model_type in ["vssm"]:
         model = Backbone_VSSM(
-            out_indices=(2,3), pretrained=None,
+            out_indices=(2,3), pretrained='pretrained/vssm1_tiny_0230s_ckpt_epoch_264.pth',
             patch_size=config.MODEL.VSSM.PATCH_SIZE,
             in_chans=config.MODEL.VSSM.IN_CHANS,
             num_classes=config.MODEL.NUM_CLASSES,
