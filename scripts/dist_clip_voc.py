@@ -1,8 +1,10 @@
+import os
+# 在这里添加下面这行代码
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import argparse
 import datetime
 import logging
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import random
 import sys
 sys.path.append(".")
@@ -33,6 +35,10 @@ parser.add_argument("--work_dir", default=None, type=str, help="work_dir")
 parser.add_argument("--radius", default=8, type=int, help="radius")
 parser.add_argument("--crop_size", default=320, type=int, help="crop_size")
 
+def worker_init_fn(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -40,6 +46,8 @@ def setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 def setup_logger(filename='test.log'):
     ## setup logger
@@ -282,14 +290,16 @@ def train(cfg):
                               num_workers=num_workers,
                               pin_memory=False,
                               drop_last=True,
-                              prefetch_factor=4)
+                              prefetch_factor=4,
+                              worker_init_fn=worker_init_fn)
 
     val_loader = DataLoader(val_dataset,
                             batch_size=1,
                             shuffle=False,
                             num_workers=num_workers,
                             pin_memory=False,
-                            drop_last=False)
+                            drop_last=False,
+                            worker_init_fn=worker_init_fn)
 
     WeCLIP_model = WeCLIP(
         num_classes=cfg.dataset.num_classes,
