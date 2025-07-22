@@ -20,7 +20,7 @@ train:
   max_iters: 100000
   cam_iters: 2000
   eval_iters: 2000
-  log_iters: 200
+  log_iters: 10
 
 
 val:
