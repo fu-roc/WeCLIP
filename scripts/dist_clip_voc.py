@@ -81,7 +81,7 @@ def validate(model=None, data_loader=None, cfg=None):
         inputs = inputs.cuda()
         labels = labels.cuda()
 
-        segs, cam, attn_loss = model(inputs, name, 'val')
+        segs, cam, attn_loss, mamba_class = model(inputs, name, 'val')
 
         resized_segs = F.interpolate(segs, size=labels.shape[1:], mode='bilinear', align_corners=False)
 
@@ -100,6 +100,117 @@ def validate(model=None, data_loader=None, cfg=None):
     cam_hist, cam_score = evaluate.scores(gts, cams, cam_hist)
     model.train()
     return seg_score, cam_score
+
+def validate(model=None, data_loader=None, cfg=None):
+
+    preds, gts, cams = [], [], []
+    cls_labels = []
+    mamba_preds = []  # 新增：存储 mamba_class 的预测结果
+
+    num = 1
+    seg_hist = np.zeros((21, 21))
+    cam_hist = np.zeros((21, 21))
+
+    for _, data in tqdm(enumerate(data_loader),
+                        total=len(data_loader), ncols=100, ascii=" >="):
+        name, inputs, labels, cls_label = data
+        inputs = inputs.cuda()
+        labels = labels.cuda()
+        cls_label = cls_label.cuda()
+
+        segs, cam, attn_loss, mamba_class = model(inputs, name, 'val')
+
+        resized_segs = F.interpolate(segs, size=labels.shape[1:], mode='bilinear', align_corners=False)
+
+        preds += list(torch.argmax(resized_segs, dim=1).cpu().numpy().astype(np.int16))
+        cams += list(cam.cpu().numpy().astype(np.int16))
+        gts += list(labels.cpu().numpy().astype(np.int16))
+
+        cls_labels.append(cls_label.detach().cpu())
+        mamba_preds.append(mamba_class.detach().cpu())  # 新增：记录 mamba_class
+
+        num += 1
+
+        if num % 1000 == 0:
+            seg_hist, _ = evaluate.scores(gts, preds, seg_hist)
+            cam_hist, _ = evaluate.scores(gts, cams, cam_hist)
+            preds, gts, cams = [], [], []
+
+    # 最后一批
+    seg_hist, seg_score = evaluate.scores(gts, preds, seg_hist)
+    cam_hist, cam_score = evaluate.scores(gts, cams, cam_hist)
+
+    # 合并所有的分类预测与标签
+    cls_labels = torch.cat(cls_labels, dim=0)
+    
+    # 新增：合并所有的 mamba_class 预测结果
+    mamba_preds = torch.cat(mamba_preds, dim=0)
+    mamba_cls_metrics = multilabel_accuracy_metrics(mamba_preds, cls_labels)  # 新增：计算 mamba_cls_metrics
+
+    model.train()
+    return seg_score, cam_score, mamba_cls_metrics  # 修改返回值
+
+
+def multilabel_accuracy_metrics(cls_token, cls_labels, threshold=0.5):
+    """
+    计算多标签分类的准确率和F1分数等指标（含中文注释）
+
+    参数:
+        cls_token: 模型输出的logits，形状为 [batch_size, num_labels]
+        cls_labels: 真实标签，形状为 [batch_size, num_labels]，元素为0或1
+        threshold: 判断为正样本的阈值（对sigmoid输出进行二值化），默认0.5
+
+    返回:
+        一个字典，包含多标签分类常用评估指标（含中文解释）
+    """
+    # 将sigmoid输出转为0/1预测标签
+    preds = (torch.sigmoid(cls_token) >= threshold).int()
+    labels = cls_labels.int()
+
+    # === 1. 严格匹配准确率（Exact Match Accuracy）===
+    # 每个样本的预测标签必须完全与真实标签一致才算正确
+    exact_match = (preds == labels).all(dim=1).float().mean().item()
+
+    # === 2. 样本级准确率（Sample-based Accuracy / Jaccard Index）===
+    # 每个样本计算预测标签与真实标签的交并比，然后对所有样本取平均
+    intersection = (preds & labels).sum(dim=1).float()
+    union = (preds | labels).sum(dim=1).float()
+    jaccard = torch.where(union == 0, torch.ones_like(union), intersection / union)
+    sample_accuracy = jaccard.mean().item()
+
+    # === 3. 微平均指标（Micro Precision / Recall / F1 / Accuracy）===
+    # 全局计算TP/FP/FN，适合类别不均衡
+    TP = (preds & labels).sum().float()
+    FP = (preds & (1 - labels)).sum().float()
+    FN = ((1 - preds) & labels).sum().float()
+    precision_micro = TP / (TP + FP + 1e-8)
+    recall_micro = TP / (TP + FN + 1e-8)
+    f1_micro = 2 * precision_micro * recall_micro / (precision_micro + recall_micro + 1e-8)
+    micro_accuracy = TP / (TP + FP + FN + 1e-8)
+
+    # === 4. 宏平均指标（Macro Precision / Recall / F1 / Accuracy）===
+    # 每个标签（列）分别计算，再取平均，适合分析各个标签表现
+    TP_per_label = (preds & labels).sum(dim=0).float()
+    FP_per_label = (preds & (1 - labels)).sum(dim=0).float()
+    FN_per_label = ((1 - preds) & labels).sum(dim=0).float()
+
+    precision_macro = TP_per_label / (TP_per_label + FP_per_label + 1e-8)
+    recall_macro = TP_per_label / (TP_per_label + FN_per_label + 1e-8)
+    f1_macro = 2 * precision_macro * recall_macro / (precision_macro + recall_macro + 1e-8)
+    f1_macro_score = f1_macro.mean().item()
+
+    # 宏平均准确率：每列的预测正确率的平均
+    correct_per_label = (preds == labels).float().mean(dim=0)
+    macro_accuracy = correct_per_label.mean().item()
+
+    return {
+        "exact_match_accuracy": exact_match,  # 严格匹配准确率
+        "sample_accuracy": sample_accuracy,  # 样本级准确率（交并比）
+        "micro_accuracy": micro_accuracy.item(),  # 微平均准确率（TP / 全部预测和真实的并集）
+        "micro_f1": f1_micro.item(),  # 微平均F1分数（适合类别不平衡）
+        "macro_f1": f1_macro_score,  # 宏平均F1分数（适合分析所有标签整体表现）
+        "macro_accuracy": macro_accuracy  # 宏平均准确率（每列准确率取平均）
+    }
 
 
 def get_seg_loss(pred, label, ignore_index=255):
@@ -186,7 +297,8 @@ def train(cfg):
         embedding_dim=cfg.clip_init.embedding_dim,
         in_channels=cfg.clip_init.in_channels,
         dataset_root_path=cfg.dataset.root_dir,
-        device='cuda'
+        device='cuda',
+        vMConfig=cfg.VMMODEL
     )
     logging.info('\nNetwork config: \n%s'%(WeCLIP_model))
     param_groups = WeCLIP_model.get_param_groups()
@@ -234,6 +346,7 @@ def train(cfg):
 
     avg_meter = AverageMeter()
 
+    bast_acore = 0
 
     for n_iter in range(cfg.train.max_iters):
         
@@ -243,7 +356,7 @@ def train(cfg):
             train_loader_iter = iter(train_loader)
             img_name, inputs, cls_labels, img_box = next(train_loader_iter)
 
-        segs, cam, attn_pred = WeCLIP_model(inputs.cuda(), img_name)
+        segs, cam, attn_pred, mamba_class = WeCLIP_model(inputs.cuda(), img_name)
 
         pseudo_label = cam
 
@@ -256,11 +369,12 @@ def train(cfg):
         attn_loss, pos_count, neg_count = get_aff_loss(attn_pred, aff_label)
 
         seg_loss = get_seg_loss(segs, pseudo_label.type(torch.long), ignore_index=cfg.dataset.ignore_index)
+        mamba_cls_loss  = F.binary_cross_entropy_with_logits(mamba_class,cls_labels.cuda())
 
-        loss = 1 * seg_loss + 0.1*attn_loss
+        loss = 1 * seg_loss + 0.1*attn_loss + 1 * mamba_cls_loss
 
 
-        avg_meter.add({'seg_loss': seg_loss.item(), 'attn_loss': attn_loss.item()})
+        avg_meter.add({'seg_loss': seg_loss.item(), 'attn_loss': attn_loss.item(), 'mamba_cls_loss': mamba_cls_loss.item()})
 
         optimizer.zero_grad()
         loss.backward()
@@ -277,9 +391,9 @@ def train(cfg):
             seg_mAcc = (preds==gts).sum()/preds.size
 
 
-            logging.info("Iter: %d; Elasped: %s; ETA: %s; LR: %.3e;, pseudo_seg_loss: %.4f, attn_loss: %.4f, pseudo_seg_mAcc: %.4f"%(n_iter+1, delta, eta, cur_lr, avg_meter.pop('seg_loss'), avg_meter.pop('attn_loss'), seg_mAcc))
+            logging.info("Iter: %d; Elasped: %s; ETA: %s; LR: %.3e;, pseudo_seg_loss: %.4f, attn_loss: %.4f, mamba_cls_loss: %.4f, pseudo_seg_mAcc: %.4f"%(n_iter+1, delta, eta, cur_lr, avg_meter.pop('seg_loss'), avg_meter.pop('attn_loss'), avg_meter.pop('mamba_cls_loss'), seg_mAcc))
 
-            writer.add_scalars('train/loss',  {"seg_loss": seg_loss.item(), "attn_loss": attn_loss.item()}, global_step=n_iter)
+            writer.add_scalars('train/loss',  {"seg_loss": seg_loss.item(), "attn_loss": attn_loss.item(), "mamba_cls_loss": mamba_cls_loss.item()}, global_step=n_iter)
 
         
         if (n_iter + 1) % cfg.train.eval_iters == 0:
@@ -287,11 +401,21 @@ def train(cfg):
             logging.info('Validating...')
             if (n_iter + 1) > 26000:
                 torch.save(WeCLIP_model.state_dict(), ckpt_name)
-            seg_score, cam_score = validate(model=WeCLIP_model, data_loader=val_loader, cfg=cfg)
+            seg_score, cam_score, mamba_cls_metrics = validate(model=WeCLIP_model, data_loader=val_loader, cfg=cfg)
             logging.info("cams score:")
             logging.info(cam_score)
             logging.info("segs score:")
             logging.info(seg_score)
+            logging.info("mamba cls metrics:")
+            logging.info(mamba_cls_metrics)
+
+            if bast_acore < seg_score["miou"]:
+                bast_acore = seg_score["miou"]
+                logging.info("bast acore:")
+                logging.info(bast_acore)
+            
+    logging.info("bast acore:")
+    logging.info(bast_acore)
 
     return True
 

@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from mamba_models import build_model
 from .segformer_head import SegFormerHead
 import numpy as np
 import clip
@@ -11,6 +13,7 @@ import os
 from torchvision.transforms import Compose, Normalize
 from .Decoder.TransDecoder import DecoderTransformer
 from WeCLIP_model.PAR import PAR
+from mamba_models.vmamba import LayerNorm2d
 
 
 
@@ -58,7 +61,7 @@ def _refine_cams(ref_mod, images, cams, valid_key):
 
 
 class WeCLIP(nn.Module):
-    def __init__(self, num_classes=None, clip_model=None, embedding_dim=256, in_channels=512, dataset_root_path=None, device='cuda'):
+    def __init__(self, num_classes=None, clip_model=None, embedding_dim=256, in_channels=512, dataset_root_path=None, device='cuda', vMConfig = None):
         super().__init__()
         self.num_classes = num_classes
         self.embedding_dim = embedding_dim
@@ -90,6 +93,26 @@ class WeCLIP(nn.Module):
         self.iter_num = 0
         self.require_all_fts = True
 
+        self.VMamba = build_model(vMConfig)
+        self.classifier = nn.Sequential(
+            LayerNorm2d(768),
+            nn.Identity(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(1),
+            nn.Linear(768, 20)
+        )
+        self.affinity_head = nn.Sequential(
+            # 1. 第一个 1x1 卷积，用于特征变换和降维
+            nn.Conv2d(384, 256, kernel_size=1, bias=False),
+            # 2. 使用 BatchNorm 或 LayerNorm 来稳定训练
+            nn.BatchNorm2d(256),
+            # 3. 非线性激活
+            nn.ReLU(inplace=True),
+            # 4. 第二个 1x1 卷积，输出最终用于计算亲和度的特征
+            nn.Conv2d(256, 128, kernel_size=1)
+        )
+
+
 
     def get_param_groups(self):
 
@@ -98,6 +121,15 @@ class WeCLIP(nn.Module):
         for param in list(self.decoder.parameters()):
             param_groups[3].append(param)
         for param in list(self.decoder_fts_fuse.parameters()):
+            param_groups[3].append(param)
+
+        # for param in list(self.VMamba.parameters()):
+        #     param_groups[3].append(param)
+
+        for param in list(self.classifier.parameters()):
+            param_groups[3].append(param)
+            
+        for param in list(self.affinity_head.parameters()):
             param_groups[3].append(param)
 
         return param_groups
@@ -111,6 +143,24 @@ class WeCLIP(nn.Module):
         self.iter_num += 1
 
         fts_all, attn_weight_list = generate_clip_fts(img, self.encoder, require_all_fts=True)
+
+      # ------------------------------
+        mamba_featuresList = self.VMamba(img)
+        mamba_features = mamba_featuresList[0]
+        mamba_features = self.affinity_head(mamba_features)
+        mamba_features = F.interpolate(
+            mamba_features,
+            size=(h // 16, w // 16),
+            mode='bilinear',
+            align_corners=False
+        )
+        mamba_class =self.classifier(mamba_featuresList[1])
+        f_b, f_c, f_h, f_w = mamba_features.shape
+        mamba_features_flatten = mamba_features.reshape(f_b, f_c, f_h*f_w)
+        mamba_preds = mamba_features_flatten.transpose(2, 1).bmm(mamba_features_flatten)
+        mamba_preds = torch.sigmoid(mamba_preds)
+
+        # ------------------------------
 
         fts_all_stack = torch.stack(fts_all, dim=0) # (11, hw, b, c)
         attn_weight_stack = torch.stack(attn_weight_list, dim=0).permute(1, 0, 2, 3)
@@ -172,6 +222,6 @@ class WeCLIP(nn.Module):
 
         all_cam_labels = torch.stack(cam_list, dim=0)
 
-        return seg, all_cam_labels, attn_pred
+        return seg, all_cam_labels, attn_pred, mamba_class
 
         

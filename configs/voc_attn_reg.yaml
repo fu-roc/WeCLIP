@@ -17,7 +17,7 @@ work_dir:
 train:
   split: train_aug
   samples_per_gpu: 4 #4 #2
-  max_iters: 30000
+  max_iters: 100000
   cam_iters: 2000
   eval_iters: 2000
   log_iters: 200
@@ -41,3 +41,24 @@ clip_init:
   clip_pretrain_path: pretrained/ViT-B-16.pt
   embedding_dim: 256
   in_channels: [768, 768,768,768]
+
+VMMODEL:
+  MODEL:
+    TYPE: vssm
+    NAME: vssm1_tiny_0230s
+    DROP_PATH_RATE: 0.2
+    VSSM:
+      EMBED_DIM: 96
+      DEPTHS: [ 2, 2, 8, 2 ]
+      SSM_D_STATE: 1
+      SSM_DT_RANK: "auto"
+      SSM_RATIO: 1.0
+      SSM_CONV: 3
+      SSM_CONV_BIAS: false
+      SSM_FORWARDTYPE: "v05_noz" # v3_noz
+      MLP_RATIO: 4.0
+      DOWNSAMPLE: "v3"
+      PATCHEMBED: "v2"
+      NORM_LAYER: "ln2d"
+
+      
